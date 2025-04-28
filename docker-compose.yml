@@ -1,0 +1,436 @@
+version: '3.8'
+
+services:
+  activemq-artemis:
+    image: apache/activemq-artemis:latest
+    container_name: activemq
+    ports:
+      # Web Console
+      - "8161:8161"
+      # CORE protocols (AMQP, MQTT, STOMP, HornetQ, OpenWire)
+      - "61616:61616"
+      # AMQP
+      - "5672:5672"
+      # MQTT
+      - "1883:1883"
+      # STOMP
+      - "61613:61613"
+      # Websocket for STOMP
+      - "61614:61614"
+    volumes:
+      - ./data/artemis_data:/var/lib/artemis/data
+      - artemis-etc:/var/lib/artemis/etc
+    environment:
+      ARTEMIS_USERNAME: artemis
+      ARTEMIS_PASSWORD: artemis
+      RESTORE_CONFIGURATION: true
+      ENABLE_JMX_EXPORTER: false
+    networks:
+      - huudan
+  oracle-db:
+    image: container-registry.oracle.com/database/express:latest
+    container_name: oracle
+    environment:
+      - ORACLE_PWD=Oracle_123	
+    ports:
+      - "1521:1521"
+    shm_size: "2g"
+    restart: unless-stopped
+    networks:
+      - huudan
+    volumes:
+      - oracle_data:/opt/oracle/oradata 
+    healthcheck:
+      test: [ "CMD", "sqlplus", "-L", "sys/Oracle_123@//localhost:1521/XEPDB1 as sysdba", "@check_health.sql" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password   # Set root password
+      MYSQL_DATABASE: my_database          # Default database name
+      MYSQL_USER: user
+      MYSQL_PASSWORD: user_password
+    command: [
+      '--character-set-server=utf8mb4',
+      '--collation-server=utf8mb4_unicode_ci',
+      '--skip-character-set-client-handshake'  # Buộc tất cả kết nối sử dụng utf8mb4
+    ]
+    ports:
+      - "3306:3306"  # Expose MySQL on port 3306
+    volumes:
+      - ./data/mysql_data:/var/lib/mysql
+    networks:
+      - huudan
+  minio:
+    container_name: minio
+    restart: unless-stopped
+    image: minio/minio
+    volumes:
+      - ./data/minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - huudan
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_ACCESS_KEY}
+      MINIO_CACHE_QUOTA: 80
+      MINIO_CACHE_AFTER: 1
+      MINIO_CACHE_WATERMARK_LOW: 70
+      MINIO_CACHE_WATERMARK_HIGH: 90
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+      MINIO_CACHE: "on"
+      MINIO_CACHE_DRIVES: /mnt/drive1,/mnt/drive2
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio-bucket:
+    image: minio/mc
+    container_name: minio-bucket
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - huudan
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc config host add my-project http://minio:9000 huudantran123@ huudantran123@;
+      /usr/bin/mc ls my-project/file-storage >/dev/null 2>&1 || /usr/bin/mc mb my-project/file-storage;
+      /usr/bin/mc policy download my-project/file-storage;
+      exit 0;
+      "
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    env_file:
+      - .env
+    command: /bin/sh -c "redis-server --requirepass $$REDIS_PASSWORD"
+    networks:
+      - huudan
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: redis-insight
+    depends_on:
+      - redis
+    restart: unless-stopped
+    ports:
+      - "5540:5540"
+    networks:
+      - huudan
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    container_name: prometheus
+    volumes:
+      - ./prometheus/:/etc/prometheus/
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - huudan
+  grafana:
+    image: grafana/grafana-oss
+    restart: unless-stopped
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_LOG_MODE=console file
+      - GF_LOG_FILTERS=alerting.notifier.slack:debug alermanager:debug ngalert:debug
+      - GF_USERS_ALLOW_SING_UP=false
+      - GF_SERVER_DOMAIN=localhost
+    networks:
+      - huudan
+
+  kafka:
+    # First Kafka broker in the cluster
+    image: bitnami/kafka:3.7.0  # Uses Bitnami's Kafka image, version 3.7.0
+    container_name: kafka
+    networks:
+      - huudan
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_CFG_LISTENERS: INTERNAL://:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      ALLOW_PLAINTEXT_LISTENER: 'yes'
+    ports:
+      - "9092:9092"  # Internal broker port
+      - "29092:29092"  # External broker port for client connections
+    volumes:
+      - kafka_data:/bitnami/kafka  # Persists Kafka data locally
+  redpanda-0:
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      # Address the broker advertises to clients that connect to the Kafka API.
+      # Use the internal addresses to connect to the Redpanda brokers'
+      # from inside the same Docker network.
+      # Use the external addresses to connect to the Redpanda brokers'
+      # from outside the Docker network.
+      - --advertise-kafka-addr internal://redpanda-0:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      # Address the broker advertises to clients that connect to the HTTP Proxy.
+      - --advertise-pandaproxy-addr internal://redpanda-0:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      # Redpanda brokers use the RPC API to communicate with each other internally.
+      - --rpc-addr redpanda-0:33145
+      - --advertise-rpc-addr redpanda-0:33145
+      # Mode dev-container uses well-known configuration properties for development in containers.
+      - --mode dev-container
+      # Tells Seastar (the framework Redpanda uses under the hood) to use 1 core on the system.
+      - --smp 1
+      - --default-log-level=info
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+    container_name: redpanda-0
+    volumes:
+      - redpanda-0:/var/lib/redpanda/data
+    networks:
+      - huudan
+    ports:
+      - 18081:18081
+      - 18082:18082
+      - 19092:19092
+      - 19644:9644
+  console:
+    container_name: redpanda-console
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    networks:
+      - huudan
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda-0:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda-0:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda-0:9644"]
+    ports:
+      - 8080:8080
+    depends_on:
+      - redpanda-0
+  mongodb:
+    container_name: mongodb
+    image: mongo:latest
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./data/mongodb_data:/data/db
+      - ./data/mongodb_log:/var/log/mongodb/
+    env_file:
+      - .env
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    command: >
+      --auth
+      --profile 2 
+      --slowms 15 
+      --slowOpSampleRate 0.5
+    networks:
+      - huudan
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: 'rabbitmq'
+    ports:
+      - 5672:5672
+      - 15672:15672
+    volumes:
+      - ./data/rabbitmq_data/:/var/lib/rabbitmq/
+      - ./data/rabbitmq_log:/var/log/rabbitmq
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.4.0
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      - xpack.security.enabled=false
+      - discovery.type=single-node
+    networks:
+      - huudan
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - 9200:9200
+  kibana:
+    container_name: kibana
+    image: docker.elastic.co/kibana/kibana:7.4.0
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200    # address of elasticsearch docker container which kibana will connect
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=kibana_password
+    networks:
+      - huudan
+    ports:
+      - 5601:5601
+    depends_on:
+      - elasticsearch                                   # kibana will start when elasticsearch has started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+      
+  logstash:
+    image: docker.elastic.co/logstash/logstash:7.4.0
+    container_name: logstash
+    restart: unless-stopped
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    environment:
+      LS_JAVA_OPTS: "-Xmx256m -Xms256m"
+    networks:
+      - huudan
+    depends_on:
+      - elasticsearch
+
+  postgres:
+    container_name: postgres
+    image: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: keycloak
+    volumes:
+       - ./data/postgres_data:/data/postgres
+    ports:
+      - "5432:5432"
+    networks:
+      - huudan
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-d", "postgres", "-U", "${POSTGRES_USER:-postgres}"]
+      timeout: 45s
+      interval: 10s
+      retries: 10
+  
+  pgadmin:
+    container_name: pgadmin
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-pgadmin4@pgadmin.org}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+       - pgadmin:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    networks:
+      - huudan
+    restart: unless-stopped
+  keycloak:
+    container_name: keycloak
+    restart: unless-stopped
+    image: quay.io/keycloak/keycloak:26.0
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: ${POSTGRES_USER:-postgres}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      KC_HTTP_ENABLED: true
+      KC_METRICS_ENABLED: true
+      KC_HOSTNAME: localhost
+      # KC_HOSTNAME_PORT: 8180
+      # KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: 8180
+      KC_HOSTNAME_STRICT: false
+      KC_HOSTNAME_STRICT_HTTPS: false
+      KC_LOG_LEVEL: info
+      KC_HEALTH_ENABLED: true
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    command: start-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8180:8080"
+      - "8787:8787" # debug port
+    networks:
+      - huudan
+networks:
+  huudan:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  kafka_data:
+  redpanda-0:
+  elasticsearch_data:
+  pgadmin:
+  keycloak_data:
+  oracle_data:	
+  artemis-etc:
