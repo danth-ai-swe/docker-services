@@ -17,7 +17,7 @@ services:
       - "61613:61613"
       # Websocket for STOMP
       - "61614:61614"
-    volumes:
+    volumes: 
       - ./data/artemis_data:/var/lib/artemis/data
       - artemis-etc:/var/lib/artemis/etc
     environment:
